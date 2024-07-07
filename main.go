@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -13,12 +12,13 @@ import (
 
 const (
 	usage = `
- countdown [-up] [-say] <duration>
+ countdown [-up] [-t] [-n] <duration>
 
  Usage
   countdown 25s
   countdown 14:15
   countdown 02:15PM
+  countdown -t Tag -n "Notes for the activity" 10m
 
  Flags
 `
@@ -33,12 +33,28 @@ var (
 	w, h           int
 	inputStartTime time.Time
 	isPaused       bool
+	tag            string
+	notes          string
+	logPath       string
 )
 
 func main() {
+
 	countUp := flag.Bool("up", false, "count up from zero")
-	sayTheTime := flag.Bool("say", false, "announce the time left")
+	tag := flag.String("t", "Unset", "The tag for this activity")
+	notes := flag.String("n", "", "Notes for this activity")
+	logPath := flag.String("f", os.Getenv("COUNTDOWN_LOG_PATH"), "The log path")
 	flag.Parse()
+
+	if *logPath == "" {
+		fmt.Println("No file argument given, set COUNTDOWN_LOG_PATH env variable or provide a file as -f argument.")
+		os.Exit(2)
+	}
+	_, err := os.OpenFile(*logPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	if err != nil {
+		fmt.Println("There was a problem accessing " + *logPath)
+		os.Exit(2)
+	}
 
 	args := flag.Args()
 	if len(args) != 1 {
@@ -67,7 +83,7 @@ func main() {
 			queues <- termbox.PollEvent()
 		}
 	}()
-	countdown(timeLeft, *countUp, *sayTheTime)
+	countdown(timeLeft, *countUp, *tag, *notes, *logPath)
 }
 
 func start(d time.Duration) {
@@ -87,17 +103,15 @@ func durationToDraw(timeLeft, totalDuration time.Duration, countUp bool) time.Du
 	return timeLeft
 }
 
-func countdown(totalDuration time.Duration, countUp bool, sayTheTime bool) {
+func countdown(totalDuration time.Duration, countUp bool, tag string, notes string, logPath string) {
 	timeLeft := totalDuration
 	var exitCode int
 	isPaused = false
 	w, h = termbox.Size()
 	start(timeLeft)
+	appendToLog("i", tag, notes, logPath)
 
 	draw(durationToDraw(timeLeft, totalDuration, countUp), w, h)
-	if sayTheTime {
-		go say(timeLeft)
-	}
 
 loop:
 	for {
@@ -105,15 +119,18 @@ loop:
 		case ev := <-queues:
 			if ev.Key == termbox.KeyEsc || ev.Key == termbox.KeyCtrlC {
 				exitCode = 1
+				appendToLog("o", tag, "", logPath)
 				break loop
 			}
 
 			if pressTime := time.Now(); ev.Key == termbox.KeySpace && pressTime.Sub(inputStartTime) > inputDelayMS {
 				if isPaused {
 					start(timeLeft)
+					appendToLog("u", tag, "", logPath)
 					draw(durationToDraw(timeLeft, totalDuration, countUp), w, h)
 				} else {
 					stop()
+					appendToLog("p", tag, "", logPath)
 					drawPause(w, h)
 				}
 
@@ -132,10 +149,8 @@ loop:
 		case <-ticker.C:
 			timeLeft -= tick
 			draw(durationToDraw(timeLeft, totalDuration, countUp), w, h)
-			if sayTheTime {
-				go say(timeLeft)
-			}
 		case <-timer.C:
+			appendToLog("o", tag, "", logPath)
 			break loop
 		}
 	}
@@ -185,10 +200,19 @@ func format(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
 }
 
-func say(d time.Duration) {
-	if d.Seconds() <= 10 {
-		cmd := exec.Command("say", fmt.Sprintf("%v", d.Seconds()))
-		_ = cmd.Run()
+func appendToLog(state string, tag string, notes string, logPath string){
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	if err != nil {
+		stderr("There was a problem accessing " + logPath)
+		os.Exit(2)
+	}
+	defer f.Close()
+
+	var log string = state + " " + time.Now().Format("2006-01-02 15:04:05") + " " +tag + "  " + notes + "\n"
+
+	if _, err = f.WriteString(log); err != nil {
+		stderr("There was a problem writing to " + logPath)
+		os.Exit(2)
 	}
 }
 
