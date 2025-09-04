@@ -1,6 +1,9 @@
 from datetime import datetime
 import json
+import re
 from typing import Any, List, Literal
+import argparse
+import os
 
 def duration_into_units(duration_in_seconds: int, desired_units: Literal["m", "h", "s"]) -> str:
     SECONDS_IN_AN_HOUR = 3600
@@ -66,8 +69,8 @@ def report(data: List[Any],
            begin: int | None = None, # inclusive
            end: int | None = None, # exclusive
            tag: str | None = None,
-           grouping: Literal["d", "w", "m", "y", "h"] | None = None,
-           units: Literal["m", "h", "s"] = "s"
+           grouping: Literal["d", "w", "m", "y", "h"] | None = "w",
+           units: Literal["m", "h", "s"] = "h"
         ):
 
     data = sorted([row for row in data], key=lambda x: (x["start_time"], x["tag"]))
@@ -107,24 +110,25 @@ def parse_row(row: str, i: int):
     tag, notes = tag_and_notes
     return parsed_time, state, tag, notes
 
-chars = {
-    "i": 1,
-    "p": 2,
-    "u": 3,
-    "o": 0,
-}
 
-table = [
-    [-1,  1, -1, -1 ], # no timer
-    [ 0, -1,  2, -1 ], # running timer
-    [ 0,  1, -1,  3 ], # paused timer
-    [ 0,  1,  2, -1 ]  # unpaused timer
-]
-state = [0, 0]
-stack = []
+def parse(filepath: str):
+    chars = {
+        "i": 1,
+        "p": 2,
+        "u": 3,
+        "o": 0,
+    }
 
-if __name__ == "__main__":
-    with open("/tmp/t.timeclock", 'r') as f:
+    table = [
+        [-1,  1, -1, -1 ], # no timer
+        [ 0, -1,  2, -1 ], # running timer
+        [ 0,  1, -1,  3 ], # paused timer
+        [ 0,  1,  2, -1 ]  # unpaused timer
+    ]
+    state = [0, 0]
+    stack = []
+
+    with open(filepath, 'r') as f:
         rows = f.readlines()
         for i, row in enumerate(rows):
             [parsed_t, char, tag, notes] = parse_row(row, i)
@@ -142,9 +146,60 @@ if __name__ == "__main__":
                     "notes": notes,
                 })
 
-            if state[0] == 1:
+            if state[0] in [1, 3]:
                 stack[-1]["duration"] += parsed_t - stack[-1]['last_timestamp']
 
             stack[-1]["last_timestamp"] = parsed_t
+    return stack
 
-    report(stack)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--tag', '-t', type=str, help="Tag to filter on")
+    parser.add_argument('--file', type=str, help='timesheet file path', required=False)
+    parser.add_argument('--begin', '-b', type=str, help='begin date', required=False, default=None)
+    parser.add_argument('--end', '-e', type=str, help='end date', required=False, default=None)
+
+    args = parser.parse_args()
+
+    stack = parse(os.environ.get("COUNTDOWN_LOG_PATH", args.file))
+
+    tag = args.tag
+    begin_date = args.begin
+    if begin_date is not None:
+        if not re.match("[0-9]{4}-[0-9]{2}", begin_date):
+            raise Exception(f"begin argument: {begin_date} must match pattern %Y-%m")
+    end_date = args.end
+    if end_date is not None:
+        if not re.match("[0-9]{4}-[0-9]{2}", end_date):
+            raise Exception(f"end argument: {end_date} must match pattern %Y-%m")
+
+    results = []
+    for item in stack:
+        start = datetime.fromtimestamp(item["start_time"])
+        end = datetime.fromtimestamp(item["start_time"]+item['duration'])
+        
+        is_after_begin = begin_date is None or begin_date <= start.strftime("%Y-%m")
+        is_before_end = end_date is None or end_date > start.strftime("%Y-%m")
+        if item['tag'] == tag and is_after_begin and is_before_end:
+            results.append({
+                "day": start.strftime("%Y-%m-%d"),
+                "notes": item["notes"],
+                "hours": item['duration'] / 3600,
+                "minutes": item['duration'] / 60
+            })
+    grouped = {}
+    for row in results:
+        grouped.setdefault(row["day"], []).append(row)
+
+    line_items = []
+    for date, rows in grouped.items():
+        notes = "\n".join(list(set(filter(lambda note: len(note) > 0, [row["notes"] for row in rows]))))
+        minutes = sum(row["minutes"] for row in rows)
+        line_items.append({
+            "date": date,
+            "notes": notes,
+            "quantity": minutes/60
+        })
+
+    for line_item in sorted(line_items, key=lambda x: x['date']):
+        print(json.dumps(line_item))
